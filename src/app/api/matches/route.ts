@@ -1,6 +1,7 @@
 import { loadEvents, getCoverageUntil } from "@/lib/sources/query";
 import { mergeEvents } from "@/lib/sources/merge";
-import { ensureFreshSync, getSyncStatus } from "@/lib/sources/sync";
+import { ensureFreshSync, getSyncStatus, syncState, idleProgress } from "@/lib/sources/sync";
+import { getMemoryEventCount } from "@/lib/sources/memory-store";
 import { SOURCE_IDS, SOURCE_LABELS, type SourceId } from "@/lib/sources/model";
 
 export const dynamic = "force-dynamic";
@@ -71,69 +72,103 @@ function parseRange(params: URLSearchParams, tab: Tab): { from: Date; to: Date }
 }
 
 export async function GET(request: Request) {
-  const params = new URL(request.url).searchParams;
-  const tab: Tab = params.get("tab") === "started" ? "started" : "upcoming";
-  const range = parseRange(params, tab);
-  if ("error" in range) {
-    return Response.json({ error: range.error }, { status: 400 });
+  try {
+    const params = new URL(request.url).searchParams;
+    const tab: Tab = params.get("tab") === "started" ? "started" : "upcoming";
+    const range = parseRange(params, tab);
+    if ("error" in range) {
+      return Response.json({ error: range.error }, { status: 400 });
+    }
+
+    const sportKeys = parseSportKeys(params.get("sports"));
+    const selectedBookmakers = parseBookmakers(params.get("bookmakers"));
+    const bookmakers: SourceId[] = selectedBookmakers.length > 0 ? selectedBookmakers : [...SOURCE_IDS];
+
+    // Trigger sync in background
+    ensureFreshSync();
+
+    // If memory/DB has no events yet, wait up to 2.5 seconds for the first live batch to load
+    if (getMemoryEventCount() === 0 && syncState.running) {
+      await Promise.race([
+        syncState.running,
+        new Promise((resolve) => setTimeout(resolve, 2500)),
+      ]);
+    }
+
+    const [events, coverageUntil, sync] = await Promise.all([
+      loadEvents(range.from, range.to),
+      getCoverageUntil(),
+      getSyncStatus(),
+    ]);
+
+    const rawCounts: Record<string, number> = {};
+    for (const event of events) rawCounts[event.source] = (rawCounts[event.source] ?? 0) + 1;
+
+    // Merge only the selected bookmakers, so labels and partial flags reflect what the user chose.
+    const scoped = events.filter((event) => bookmakers.includes(event.source));
+    const merged = mergeEvents(scoped);
+
+    const sportMap = new Map<string, { key: string; name: { en: string; ru: string }; count: number }>();
+    for (const entry of merged) {
+      const existing = sportMap.get(entry.sportKey);
+      if (existing) existing.count += 1;
+      else sportMap.set(entry.sportKey, { key: entry.sportKey, name: entry.sportName, count: 1 });
+    }
+    const sportFacets = [...sportMap.values()].sort((a, b) => b.count - a.count);
+
+    const filtered = sportKeys.length > 0 ? merged.filter((entry) => sportKeys.includes(entry.sportKey)) : merged;
+    // Upcoming: soonest first. Started: most recently started first.
+    const ordered = tab === "started" ? [...filtered].reverse() : filtered;
+
+    const bookmakerFacets = SOURCE_IDS.map((id) => {
+      const status = sync.sources.find((source) => source.id === id);
+      return {
+        id,
+        label: SOURCE_LABELS[id],
+        count: rawCounts[id] ?? 0,
+        selected: bookmakers.includes(id),
+        lastStatus: status?.lastRun?.status ?? null,
+        lastError: status?.lastRun?.error ?? null,
+      };
+    });
+
+    return Response.json(
+      {
+        tab,
+        range: { from: range.from.toISOString(), to: range.to.toISOString() },
+        total: ordered.length,
+        truncated: ordered.length > MAX_ENTRIES,
+        entries: ordered.slice(0, MAX_ENTRIES),
+        facets: { sports: sportFacets, bookmakers: bookmakerFacets },
+        coverageUntil,
+        sync,
+        generatedAt: new Date().toISOString(),
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  } catch (error) {
+    console.error("[api/matches] unhandled error:", error);
+    const sync = await getSyncStatus().catch(() => ({
+      running: false,
+      progress: idleProgress(),
+      sources: [],
+      feedHealth: { healthy: false, lastCheckedAt: null, lastGoodDomain: null, lastError: null },
+    }));
+
+    return Response.json(
+      {
+        tab: "upcoming",
+        range: { from: new Date().toISOString(), to: new Date(Date.now() + 7200000).toISOString() },
+        total: 0,
+        truncated: false,
+        entries: [],
+        facets: { sports: [], bookmakers: [] },
+        coverageUntil: null,
+        sync,
+        generatedAt: new Date().toISOString(),
+        warning: error instanceof Error ? error.message : "Temporary error",
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   }
-
-  const sportKeys = parseSportKeys(params.get("sports"));
-  const selectedBookmakers = parseBookmakers(params.get("bookmakers"));
-  const bookmakers: SourceId[] = selectedBookmakers.length > 0 ? selectedBookmakers : [...SOURCE_IDS];
-
-  // Refresh bookmaker feeds in the background when stale; the response uses what is stored now.
-  ensureFreshSync();
-
-  const [events, coverageUntil, sync] = await Promise.all([
-    loadEvents(range.from, range.to),
-    getCoverageUntil(),
-    getSyncStatus(),
-  ]);
-
-  const rawCounts: Record<string, number> = {};
-  for (const event of events) rawCounts[event.source] = (rawCounts[event.source] ?? 0) + 1;
-
-  // Merge only the selected bookmakers, so labels and partial flags reflect what the user chose.
-  const scoped = events.filter((event) => bookmakers.includes(event.source));
-  const merged = mergeEvents(scoped);
-
-  const sportMap = new Map<string, { key: string; name: { en: string; ru: string }; count: number }>();
-  for (const entry of merged) {
-    const existing = sportMap.get(entry.sportKey);
-    if (existing) existing.count += 1;
-    else sportMap.set(entry.sportKey, { key: entry.sportKey, name: entry.sportName, count: 1 });
-  }
-  const sportFacets = [...sportMap.values()].sort((a, b) => b.count - a.count);
-
-  const filtered = sportKeys.length > 0 ? merged.filter((entry) => sportKeys.includes(entry.sportKey)) : merged;
-  // Upcoming: soonest first. Started: most recently started first.
-  const ordered = tab === "started" ? [...filtered].reverse() : filtered;
-
-  const bookmakerFacets = SOURCE_IDS.map((id) => {
-    const status = sync.sources.find((source) => source.id === id);
-    return {
-      id,
-      label: SOURCE_LABELS[id],
-      count: rawCounts[id] ?? 0,
-      selected: bookmakers.includes(id),
-      lastStatus: status?.lastRun?.status ?? null,
-      lastError: status?.lastRun?.error ?? null,
-    };
-  });
-
-  return Response.json(
-    {
-      tab,
-      range: { from: range.from.toISOString(), to: range.to.toISOString() },
-      total: ordered.length,
-      truncated: ordered.length > MAX_ENTRIES,
-      entries: ordered.slice(0, MAX_ENTRIES),
-      facets: { sports: sportFacets, bookmakers: bookmakerFacets },
-      coverageUntil,
-      sync,
-      generatedAt: new Date().toISOString(),
-    },
-    { headers: { "Cache-Control": "no-store" } },
-  );
 }
